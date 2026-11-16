@@ -1,0 +1,82 @@
+name: Inspect GCam (sensor direct channel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_name:
+        description: "GCam APK file name in the release (the new one that restarts the phone)"
+        required: true
+        default: "GCam.apk"
+      release_tag:
+        description: "Release tag where the APK was uploaded"
+        required: true
+        default: "gcam"
+      apktool_version:
+        description: "apktool version"
+        default: "2.9.3"
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APK: ${{ inputs.apk_name }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre-headless zip unzip
+          wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
+
+      - name: Download APK from release
+        run: |
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern "$APK" --dir . --clobber
+          ls -lh "$APK"
+
+      # -r: skip resources (faster, smali is all we need)
+      - name: Decompile
+        run: java -jar apktool.jar d -r -f "$APK" -o out
+
+      - name: Collect sensor-related code
+        run: |
+          set -uo pipefail
+          mkdir -p inspect/smali
+
+          # 1) Everything that touches direct channels (this is what crashes the HAL)
+          DIRECT='createDirectChannel|SensorDirectChannel|configureDirectChannel|isDirectChannelTypeSupported|TYPE_HARDWARE_BUFFER|TYPE_MEMORY_FILE|registerDirectChannel'
+          grep -rnE "$DIRECT" out/smali* > inspect/direct_hits.txt || true
+          grep -rlE "$DIRECT" out/smali* > inspect/direct_files.txt || true
+          while read -r f; do
+            mkdir -p "inspect/smali/$(dirname "$f")"
+            cp "$f" "inspect/smali/$f"
+          done < inspect/direct_files.txt
+
+          # 2) Normal sensor use (line list only, to keep the zip small)
+          grep -rnE 'Landroid/hardware/SensorManager;->(registerListener|getDefaultSensor|getSensorList|requestTriggerSensor)' \
+            out/smali* > inspect/listener_hits.txt || true
+          grep -rnE 'Landroid/hardware/Sensor;->(getType|isDirectChannelTypeSupported|getHighestDirectReportRateLevel)' \
+            out/smali* > inspect/sensor_api_hits.txt || true
+
+          echo "direct-channel files: $(wc -l < inspect/direct_files.txt)"
+          echo "direct-channel lines: $(wc -l < inspect/direct_hits.txt)"
+          echo "registerListener lines: $(wc -l < inspect/listener_hits.txt)"
+          du -sh inspect
+
+      - name: Zip and upload
+        run: |
+          zip -r gcam_inspect.zip inspect
+          ls -lh gcam_inspect.zip
+          gh release view inspect-data --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create inspect-data --repo "${{ github.repository }}" \
+              --title "inspect-data" --notes "Auto-generated inspect files"
+          gh release upload inspect-data gcam_inspect.zip --repo "${{ github.repository }}" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gcam_inspect
+          path: gcam_inspect.zip
