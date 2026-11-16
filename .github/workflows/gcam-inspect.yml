@@ -1,4 +1,4 @@
-name: Inspect GCam (sensor direct channel)
+name: Patch GCam (disable direct gyro channel)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 jobs:
-  inspect:
+  patch:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -38,45 +38,80 @@ jobs:
             --pattern "$APK" --dir . --clobber
           ls -lh "$APK"
 
-      # -r: skip resources (faster, smali is all we need)
+      # -r keeps resources.arsc untouched, smali is still decoded
       - name: Decompile
         run: java -jar apktool.jar d -r -f "$APK" -o out
 
-      - name: Collect sensor-related code
+      - name: Patch smali
         run: |
-          set -uo pipefail
-          mkdir -p inspect/smali
+          python3 - <<'PY'
+          import subprocess, sys
 
-          # 1) Everything that touches direct channels (this is what crashes the HAL)
-          DIRECT='createDirectChannel|SensorDirectChannel|configureDirectChannel|isDirectChannelTypeSupported|TYPE_HARDWARE_BUFFER|TYPE_MEMORY_FILE|registerDirectChannel'
-          grep -rnE "$DIRECT" out/smali* > inspect/direct_hits.txt || true
-          grep -rlE "$DIRECT" out/smali* > inspect/direct_files.txt || true
-          while read -r f; do
-            mkdir -p "inspect/smali/$(dirname "$f")"
-            cp "$f" "inspect/smali/$f"
-          done < inspect/direct_files.txt
+          def find(name):
+              r = subprocess.run(["find", "out", "-name", name],
+                                 capture_output=True, text=True).stdout.split()
+              if len(r) != 1:
+                  sys.exit(f"PATCH FAILED: expected exactly one {name}, found {r}")
+              return r[0]
 
-          # 2) Normal sensor use (line list only, to keep the zip small)
-          grep -rnE 'Landroid/hardware/SensorManager;->(registerListener|getDefaultSensor|getSensorList|requestTriggerSensor)' \
-            out/smali* > inspect/listener_hits.txt || true
-          grep -rnE 'Landroid/hardware/Sensor;->(getType|isDirectChannelTypeSupported|getHighestDirectReportRateLevel)' \
-            out/smali* > inspect/sensor_api_hits.txt || true
+          def patch(path, old, new):
+              s = open(path, encoding="utf-8").read()
+              n = s.count(old)
+              if n != 1:
+                  sys.exit(f"PATCH FAILED: {path}: expected 1 match, found {n}")
+              open(path, "w", encoding="utf-8").write(s.replace(old, new))
+              print("patched", path)
 
-          echo "direct-channel files: $(wc -l < inspect/direct_files.txt)"
-          echo "direct-channel lines: $(wc -l < inspect/direct_hits.txt)"
-          echo "registerListener lines: $(wc -l < inspect/listener_hits.txt)"
-          du -sh inspect
+          # 1) Provider of the hardware-buffer direct gyro: force "not available",
+          #    so GCam falls back to its normal gyro listener (like the old version).
+          patch(
+              find("jhe.smali"),
+              "    iget-boolean v1, v1, Llzh;->d:Z\n\n    if-eqz v1, :cond_2\n",
+              "    const/4 v1, 0x0\n\n    if-eqz v1, :cond_2\n",
+          )
 
-      - name: Zip and upload
+          # 2) Safety net: never call SensorManager.createDirectChannel.
+          #    The code already handles a null result ("Creating direct channel returned null").
+          patch(
+              find("lww.smali"),
+              "    invoke-virtual {v4, v0}, Landroid/hardware/SensorManager;->createDirectChannel(Landroid/hardware/HardwareBuffer;)Landroid/hardware/SensorDirectChannel;\n\n    move-result-object v2\n",
+              "    const/4 v2, 0x0\n",
+          )
+          PY
+
+      - name: Rebuild
         run: |
-          zip -r gcam_inspect.zip inspect
-          ls -lh gcam_inspect.zip
-          gh release view inspect-data --repo "${{ github.repository }}" >/dev/null 2>&1 || \
-            gh release create inspect-data --repo "${{ github.repository }}" \
-              --title "inspect-data" --notes "Auto-generated inspect files"
-          gh release upload inspect-data gcam_inspect.zip --repo "${{ github.repository }}" --clobber
+          java -jar apktool.jar b out -o unsigned.apk
+          ls -lh unsigned.apk
+
+      # Keep the same signing key between runs so updates install over each other
+      - name: Restore signing key
+        uses: actions/cache@v4
+        with:
+          path: gcam.jks
+          key: gcam-signing-key-v1
+
+      - name: Align and sign
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          if [ ! -f gcam.jks ]; then
+            keytool -genkeypair -keystore gcam.jks -storepass android -keypass android \
+              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=gcam-patch"
+          fi
+          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          $BT/apksigner sign --ks gcam.jks --ks-pass pass:android --key-pass pass:android \
+            --out "GCam-patched.apk" aligned.apk
+          $BT/apksigner verify -v GCam-patched.apk | head -5
+          ls -lh GCam-patched.apk
+
+      - name: Upload to release
+        run: |
+          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "${{ github.repository }}" \
+              --title "$TAG" --notes "GCam files"
+          gh release upload "$TAG" GCam-patched.apk --repo "${{ github.repository }}" --clobber
 
       - uses: actions/upload-artifact@v4
         with:
-          name: gcam_inspect
-          path: gcam_inspect.zip
+          name: GCam-patched
+          path: GCam-patched.apk
