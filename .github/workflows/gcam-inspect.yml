@@ -3,40 +3,39 @@ name: Patch GCam (disable direct gyro channel)
 on:
   workflow_dispatch:
     inputs:
-      apk_name:
-        description: "GCam APK file name in the release (the new one that restarts the phone)"
+      apk_url:
+        description: "Direct download link to the GCam APK"
         required: true
-        default: "GCam.apk"
-      release_tag:
-        description: "Release tag where the APK was uploaded"
-        required: true
-        default: "gcam"
       apktool_version:
         description: "apktool version"
         default: "2.9.3"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   patch:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ github.token }}
-      APK: ${{ inputs.apk_name }}
-      TAG: ${{ inputs.release_tag }}
+      APK_URL: ${{ inputs.apk_url }}
+      APK: gcam.apk
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jre-headless zip unzip
+          sudo apt-get install -y default-jre-headless zip unzip curl
           wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
 
-      - name: Download APK from release
+      - name: Download APK from link
         run: |
-          gh release download "$TAG" --repo "${{ github.repository }}" \
-            --pattern "$APK" --dir . --clobber
+          curl -L --fail --retry 3 --retry-delay 3 -o "$APK" "$APK_URL"
           ls -lh "$APK"
+          # APK is a zip file; fail early if the link returned an HTML page instead
+          if ! unzip -tq "$APK" >/dev/null 2>&1; then
+            echo "::error::Downloaded file is not a valid APK. Use a direct download link (not a web page)."
+            head -c 300 "$APK"
+            exit 1
+          fi
 
       # -r keeps resources.arsc untouched, smali is still decoded
       - name: Decompile
@@ -104,14 +103,8 @@ jobs:
           $BT/apksigner verify -v GCam-patched.apk | head -5
           ls -lh GCam-patched.apk
 
-      - name: Upload to release
-        run: |
-          gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
-            gh release create "$TAG" --repo "${{ github.repository }}" \
-              --title "$TAG" --notes "GCam files"
-          gh release upload "$TAG" GCam-patched.apk --repo "${{ github.repository }}" --clobber
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
         with:
           name: GCam-patched
           path: GCam-patched.apk
