@@ -1,110 +1,130 @@
-name: Patch GCam (disable direct gyro channel)
+name: Inspect GCam settings (hardware level / viewfinder format)
 
 on:
   workflow_dispatch:
     inputs:
-      apk_url:
-        description: "Direct download link to the GCam APK"
+      apk_name:
+        description: "GCam APK file name in the release (the ORIGINAL new GCam, not the patched one)"
         required: true
+        default: "GCam.apk"
+      release_tag:
+        description: "Release tag where the APK was uploaded"
+        required: true
+        default: "gcam"
       apktool_version:
         description: "apktool version"
         default: "2.9.3"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  patch:
+  inspect:
     runs-on: ubuntu-latest
     env:
-      APK_URL: ${{ inputs.apk_url }}
-      APK: gcam.apk
+      GH_TOKEN: ${{ github.token }}
+      APK: ${{ inputs.apk_name }}
+      TAG: ${{ inputs.release_tag }}
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jre-headless zip unzip curl
+          sudo apt-get install -y default-jre-headless zip unzip
           wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
 
-      - name: Download APK from link
+      - name: Download APK from release
         run: |
-          curl -L --fail --retry 3 --retry-delay 3 -o "$APK" "$APK_URL"
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern "$APK" --dir . --clobber
           ls -lh "$APK"
-          # APK is a zip file; fail early if the link returned an HTML page instead
-          if ! unzip -tq "$APK" >/dev/null 2>&1; then
-            echo "::error::Downloaded file is not a valid APK. Use a direct download link (not a web page)."
-            head -c 300 "$APK"
-            exit 1
-          fi
 
-      # -r keeps resources.arsc untouched, smali is still decoded
+      # Full decode (resources + smali): the settings screen lives in res/xml
       - name: Decompile
-        run: java -jar apktool.jar d -r -f "$APK" -o out
+        run: java -jar apktool.jar d -f "$APK" -o outfull
 
-      - name: Patch smali
+      - name: Find the two settings
         run: |
+          mkdir -p inspect
           python3 - <<'PY'
-          import subprocess, sys
+          import glob, json, os, re, shutil, subprocess
+          import xml.etree.ElementTree as ET
 
-          def find(name):
-              r = subprocess.run(["find", "out", "-name", name],
-                                 capture_output=True, text=True).stdout.split()
-              if len(r) != 1:
-                  sys.exit(f"PATCH FAILED: expected exactly one {name}, found {r}")
-              return r[0]
+          out = "outfull"
+          pat = re.compile(r"hardware\s*level|view\s*finder|viewfinder", re.I)
 
-          def patch(path, old, new):
-              s = open(path, encoding="utf-8").read()
-              n = s.count(old)
-              if n != 1:
-                  sys.exit(f"PATCH FAILED: {path}: expected 1 match, found {n}")
-              open(path, "w", encoding="utf-8").write(s.replace(old, new))
-              print("patched", path)
+          def strip(attrs):
+              return {k.split("}")[-1]: v for k, v in attrs.items()}
 
-          # 1) Provider of the hardware-buffer direct gyro: force "not available",
-          #    so GCam falls back to its normal gyro listener (like the old version).
-          patch(
-              find("jhe.smali"),
-              "    iget-boolean v1, v1, Llzh;->d:Z\n\n    if-eqz v1, :cond_2\n",
-              "    const/4 v1, 0x0\n\n    if-eqz v1, :cond_2\n",
-          )
+          # 1) string resources whose text mentions the settings
+          names = {}
+          for f in glob.glob(f"{out}/res/values*/strings.xml"):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for s in root.iter("string"):
+                  text = "".join(s.itertext())
+                  if s.get("name") and pat.search(text):
+                      names.setdefault(s.get("name"), []).append({"file": f, "text": text})
 
-          # 2) Safety net: never call SensorManager.createDirectChannel.
-          #    The code already handles a null result ("Creating direct channel returned null").
-          patch(
-              find("lww.smali"),
-              "    invoke-virtual {v4, v0}, Landroid/hardware/SensorManager;->createDirectChannel(Landroid/hardware/HardwareBuffer;)Landroid/hardware/SensorDirectChannel;\n\n    move-result-object v2\n",
-              "    const/4 v2, 0x0\n",
-          )
+          # 2) preference elements that use those strings as their title
+          matches, keep = [], set()
+          for f in glob.glob(f"{out}/res/xml*/*.xml"):
+              try:
+                  root = ET.parse(f).getroot()
+              except Exception:
+                  continue
+              for el in root.iter():
+                  a = strip(el.attrib)
+                  title = a.get("title", "")
+                  if title.startswith("@string/") and title.split("/")[1] in names:
+                      matches.append({"file": f, "tag": el.tag, "attrs": a})
+                      keep.add(f)
+
+          # 3) smali that mentions each preference key
+          keys = sorted({m["attrs"].get("key") for m in matches if m["attrs"].get("key")})
+          smali_hits = {}
+          for k in keys:
+              r = subprocess.run(["grep", "-rnF", f'"{k}"'] + glob.glob(f"{out}/smali*"),
+                                 capture_output=True, text=True).stdout.splitlines()
+              smali_hits[k] = r[:40]
+
+          # 4) fallback: key-looking strings in smali, in case the screen is not XML
+          fb = subprocess.run(
+              ["grep", "-rniEo", r'"[a-z_]*(hardware_?level|viewfinder|view_finder|vf_format)[a-z_]*"']
+              + glob.glob(f"{out}/smali*"), capture_output=True, text=True).stdout.splitlines()
+
+          json.dump({"string_names": names, "pref_matches": matches,
+                     "smali_hits": smali_hits, "fallback_smali_strings": fb[:200]},
+                    open("inspect/settings_matches.json", "w"), indent=2)
+
+          # 5) copy the XML files and the arrays they use
+          for f in keep:
+              d = os.path.join("inspect", os.path.dirname(f))
+              os.makedirs(d, exist_ok=True)
+              shutil.copy(f, d)
+          for f in glob.glob(f"{out}/res/values*/arrays.xml"):
+              d = os.path.join("inspect", os.path.dirname(f))
+              os.makedirs(d, exist_ok=True)
+              shutil.copy(f, d)
+
+          print("string names:", list(names))
+          print("preference matches:", len(matches))
+          print("keys:", keys)
+          print("fallback smali strings:", len(fb))
           PY
+          du -sh inspect
 
-      - name: Rebuild
+      - name: Zip and upload
         run: |
-          java -jar apktool.jar b out -o unsigned.apk
-          ls -lh unsigned.apk
+          zip -r gcam_prefs_inspect.zip inspect
+          ls -lh gcam_prefs_inspect.zip
+          gh release view inspect-data --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create inspect-data --repo "${{ github.repository }}" \
+              --title "inspect-data" --notes "Auto-generated inspect files"
+          gh release upload inspect-data gcam_prefs_inspect.zip --repo "${{ github.repository }}" --clobber
 
-      # Keep the same signing key between runs so updates install over each other
-      - name: Restore signing key
-        uses: actions/cache@v4
+      - uses: actions/upload-artifact@v4
         with:
-          path: gcam.jks
-          key: gcam-signing-key-v1
-
-      - name: Align and sign
-        run: |
-          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          if [ ! -f gcam.jks ]; then
-            keytool -genkeypair -keystore gcam.jks -storepass android -keypass android \
-              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=gcam-patch"
-          fi
-          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
-          $BT/apksigner sign --ks gcam.jks --ks-pass pass:android --key-pass pass:android \
-            --out "GCam-patched.apk" aligned.apk
-          $BT/apksigner verify -v GCam-patched.apk | head -5
-          ls -lh GCam-patched.apk
-
-      - name: Upload as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: GCam-patched
-          path: GCam-patched.apk
+          name: gcam_prefs_inspect
+          path: gcam_prefs_inspect.zip
