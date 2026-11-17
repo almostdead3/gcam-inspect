@@ -19,6 +19,18 @@ on:
         description: "Also make Hardware level = Full and Viewfinder format = JPEG the defaults (main + front)"
         type: boolean
         default: true
+      app_name:
+        description: "App name shown on the launcher (empty = keep the original name)"
+        required: false
+        default: "Camera"
+      icon_link:
+        description: "App icon link - paste here (square PNG, 512px or more, transparent background is best). Empty = keep the original icon"
+        required: false
+        default: ""
+      icon_background:
+        description: "Icon background colour for a transparent logo (hex)"
+        required: false
+        default: "#FFFFFF"
       apktool_version:
         description: "apktool version"
         default: "2.9.3"
@@ -35,12 +47,15 @@ jobs:
       APK: ${{ inputs.apk_name }}
       TAG: ${{ inputs.release_tag }}
       PATCH_PREFS: ${{ inputs.patch_prefs }}
+      APP_NAME: ${{ inputs.app_name }}
+      ICON_LINK: ${{ inputs.icon_link }}
+      ICON_BG: ${{ inputs.icon_background }}
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y default-jre-headless zip unzip aria2
-          python3 -m pip install --break-system-packages gdown
+          python3 -m pip install --break-system-packages gdown pillow
           wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
 
       - name: Get the APK (link or release)
@@ -63,11 +78,32 @@ jobs:
           # an expired or wrong link often returns an HTML page instead of the APK
           unzip -tq input.apk >/dev/null || { echo "The downloaded file is not a valid APK. Check the link."; exit 1; }
 
-      # With patch_prefs the resources are decoded too (the settings live in res/xml).
+      - name: Get the icon (link)
+        if: ${{ inputs.icon_link != '' }}
+        run: |
+          set -euo pipefail
+          if echo "$ICON_LINK" | grep -q "drive.google.com"; then
+            gdown --fuzzy "$ICON_LINK" -O icon_dl
+          else
+            aria2c -x16 -s16 -k1M --file-allocation=none -d . -o icon_dl "$ICON_LINK"
+          fi
+          python3 - <<'PY'
+          from PIL import Image
+          try:
+              im = Image.open("icon_dl").convert("RGBA")
+          except Exception:
+              raise SystemExit("The icon link is not a valid image (PNG/JPG/WEBP). Check the link.")
+          print("icon:", im.size)
+          if min(im.size) < 192:
+              print("WARNING: the icon is small, 512px or more looks better")
+          im.save("icon_src.png")
+          PY
+
+      # With patch_prefs (or a new name/icon) the resources are decoded too (the settings live in res/xml).
       # Without it, -r keeps resources.arsc untouched (safer rebuild).
       - name: Decompile
         run: |
-          if [ "$PATCH_PREFS" = "true" ]; then
+          if [ "$PATCH_PREFS" = "true" ] || [ -n "$APP_NAME" ] || [ -n "$ICON_LINK" ]; then
             java -jar apktool.jar d -f input.apk -o out
           else
             java -jar apktool.jar d -r -f input.apk -o out
@@ -122,6 +158,283 @@ jobs:
               open(xml, "w", encoding="utf-8").write(s)
           PY
 
+      - name: Rebrand (app name + icon)
+        if: ${{ inputs.app_name != '' || inputs.icon_link != '' }}
+        run: |
+          python3 - <<'PY'
+          import glob, os, re, sys
+          import xml.etree.ElementTree as ET
+          from PIL import Image
+
+          NAME = os.environ.get("APP_NAME", "").strip()
+          ICON = "icon_src.png" if os.path.exists("icon_src.png") else None
+          BG_INPUT = os.environ.get("ICON_BG", "#FFFFFF").strip() or "#FFFFFF"
+          ANDROID = "http://schemas.android.com/apk/res/android"
+          A = "{%s}" % ANDROID
+          report = []
+
+          def log(msg):
+              print(msg)
+              report.append(msg)
+
+          man_path = "out/AndroidManifest.xml"
+          man_text = open(man_path, encoding="utf-8").read()
+          for prefix, uri in re.findall(r'xmlns:([\w-]+)="([^"]+)"', man_text):
+              ET.register_namespace(prefix, uri)
+          tree = ET.parse(man_path)
+          root = tree.getroot()
+          app = root.find("application")
+          if app is None:
+              sys.exit("REBRAND FAILED: no <application> in AndroidManifest.xml")
+
+          def is_launcher(c):
+              for f in c.findall("intent-filter"):
+                  acts = [a.get(A + "name") for a in f.findall("action")]
+                  cats = [x.get(A + "name") for x in f.findall("category")]
+                  if "android.intent.action.MAIN" in acts and "android.intent.category.LAUNCHER" in cats:
+                      return True
+              return False
+
+          launchers = [c for c in list(app.findall("activity")) + list(app.findall("activity-alias")) if is_launcher(c)]
+          log("launcher entries: %s" % [c.get(A + "name") for c in launchers])
+          if not launchers:
+              log("WARNING: no launcher activity found, nothing changed")
+              open("rebrand_report.txt", "w").write("\n".join(report))
+              sys.exit(0)
+
+          manifest_changed = False
+
+          # ---------- app name ----------
+          def set_string(name, value):
+              esc = value.replace("&", "&amp;").replace("<", "&lt;").replace("'", "\\'")
+              pat = re.compile(r'(<string\b[^>]*\bname="%s"[^>]*>)(.*?)(</string>)' % re.escape(name), re.S)
+              n_total = 0
+              for f in glob.glob("out/res/values*/*.xml"):
+                  s = open(f, encoding="utf-8").read()
+                  s2, n = pat.subn(lambda m: m.group(1) + esc + m.group(3), s)
+                  if n:
+                      open(f, "w", encoding="utf-8").write(s2)
+                      n_total += n
+              return n_total
+
+          if NAME:
+              done = set()
+              for c in launchers:
+                  label = c.get(A + "label") or app.get(A + "label")
+                  if label and label.startswith("@string/"):
+                      sname = label.split("/", 1)[1]
+                      if sname in done:
+                          continue
+                      n = set_string(sname, NAME)
+                      done.add(sname)
+                      log("app name: string '%s' set to '%s' in %d place(s)" % (sname, NAME, n))
+                      if n == 0:
+                          log("WARNING: string '%s' not found in res/values*/" % sname)
+                  else:
+                      c.set(A + "label", NAME)
+                      if app.get(A + "label") and not app.get(A + "label").startswith("@string/"):
+                          app.set(A + "label", NAME)
+                      manifest_changed = True
+                      log("app name: literal label on %s set to '%s'" % (c.get(A + "name"), NAME))
+          else:
+              log("app name: unchanged (empty input)")
+
+          # ---------- icon ----------
+          def res_files(kind, name):
+              out = []
+              for d in sorted(glob.glob("out/res/%s*" % kind)):
+                  for ext in ("png", "webp", "jpg", "xml"):
+                      p = "%s/%s.%s" % (d, name, ext)
+                      if os.path.exists(p):
+                          out.append(p)
+              return out
+
+          def fit(img, size, scale, bg=None):
+              W, H = size
+              canvas = Image.new("RGBA", (W, H), bg if bg else (0, 0, 0, 0))
+              s = int(min(W, H) * scale)
+              im = img.copy()
+              im.thumbnail((s, s), Image.LANCZOS)
+              canvas.paste(im, ((W - im.width) // 2, (H - im.height) // 2), im)
+              return canvas
+
+          def parse_color(h):
+              h = h.lstrip("#")
+              if len(h) == 3:
+                  h = "".join(c * 2 for c in h)
+              return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+
+          ADAPTIVE_XML = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                          '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                          '    <background android:drawable="@drawable/gcam_icon_bg"/>\n'
+                          '    <foreground android:drawable="@drawable/gcam_icon_fg"/>\n'
+                          '</adaptive-icon>\n')
+
+          if ICON:
+              icon = Image.open(ICON).convert("RGBA")
+              opaque = icon.getchannel("A").getextrema()[0] == 255
+              bg = icon.getpixel((2, 2)) if opaque else parse_color(BG_INPUT)
+              log("icon source %dx%d, %s -> adaptive background %s" % (icon.width, icon.height,
+                  "opaque" if opaque else "transparent", "#%02x%02x%02x" % bg[:3]))
+
+              refs = set()
+              for el in [app] + launchers:
+                  for attr in ("icon", "roundIcon"):
+                      v = el.get(A + attr)
+                      if v and re.match(r"@(mipmap|drawable)/", v):
+                          refs.add(v)
+              log("icon references: %s" % sorted(refs))
+
+              adaptive_written = False
+              for ref in sorted(refs):
+                  kind, name = ref[1:].split("/", 1)
+                  files = res_files(kind, name)
+                  if not files:
+                      log("WARNING: no files found for %s" % ref)
+                  for p in files:
+                      ext = p.rsplit(".", 1)[1]
+                      if ext == "xml":
+                          head = open(p, encoding="utf-8").read(2000)
+                          if "<adaptive-icon" in head:
+                              open(p, "w", encoding="utf-8").write(ADAPTIVE_XML)
+                              adaptive_written = True
+                              log("adaptive icon rewritten: %s" % p)
+                          else:
+                              log("WARNING: %s is not an adaptive icon, skipped" % p)
+                      else:
+                          size = Image.open(p).size
+                          new = fit(icon, size, 1.0)
+                          if ext == "jpg":
+                              new = new.convert("RGB")
+                              new.save(p, "JPEG", quality=95)
+                          else:
+                              new.save(p, "WEBP" if ext == "webp" else "PNG")
+                          log("raster icon replaced: %s (%dx%d)" % (p, size[0], size[1]))
+
+              if adaptive_written:
+                  os.makedirs("out/res/drawable-nodpi", exist_ok=True)
+                  fit(icon, (432, 432), 0.66).save("out/res/drawable-nodpi/gcam_icon_fg.png")
+                  Image.new("RGBA", (432, 432), bg).save("out/res/drawable-nodpi/gcam_icon_bg.png")
+                  log("added out/res/drawable-nodpi/gcam_icon_fg.png and gcam_icon_bg.png")
+          else:
+              log("icon: unchanged (no icon link given)")
+
+          if manifest_changed:
+              tree.write(man_path, encoding="utf-8", xml_declaration=True)
+              log("manifest rewritten")
+
+          open("rebrand_report.txt", "w").write("\n".join(report))
+          PY
+
+      - name: Rename package to com.oneplus.camera (McLaren icon)
+        run: |
+          python3 - <<'PY'
+          import glob, re, sys
+          import xml.etree.ElementTree as ET
+
+          NEW_PKG = "com.oneplus.camera"
+          NEW_ACT = "com.oneplus.camera.OPCameraActivity"
+          ANDROID = "http://schemas.android.com/apk/res/android"
+          A = "{%s}" % ANDROID
+
+          man_path = "out/AndroidManifest.xml"
+          raw = open(man_path, "rb").read()
+          if not raw.lstrip().startswith(b"<"):
+              sys.exit("PATCH FAILED: AndroidManifest.xml was not decoded (keep app_name, icon_link or patch_prefs set so apktool decodes resources)")
+          for prefix, uri in re.findall(r'xmlns:([\w-]+)="([^"]+)"', raw.decode("utf-8")):
+              ET.register_namespace(prefix, uri)
+          tree = ET.parse(man_path)
+          root = tree.getroot()
+          app = root.find("application")
+          OLD = root.get("package")
+          if app is None or not OLD:
+              sys.exit("PATCH FAILED: no <application> or package in AndroidManifest.xml")
+          print("package:", OLD, "->", NEW_PKG)
+
+          # 1) make every component class name fully qualified (they must not depend on the package any more)
+          COMP = ("application", "activity", "activity-alias", "service", "receiver", "provider")
+          CLS = ("name", "targetActivity", "parentActivityName")
+          classes = []
+          for el in root.iter():
+              if el.tag in COMP:
+                  for a in CLS:
+                      v = el.get(A + a)
+                      if not v:
+                          continue
+                      if v.startswith("."):
+                          v = OLD + v
+                      elif "." not in v:
+                          v = OLD + "." + v
+                      el.set(A + a, v)
+                      if a == "name" and el.tag != "application":
+                          classes.append(v)
+
+          # 2) rename the package in everything else (permissions, authorities, actions ...)
+          for el in root.iter():
+              for k, v in list(el.attrib.items()):
+                  if el.tag in COMP and k in [A + a for a in CLS]:
+                      continue
+                  if OLD in v:
+                      el.set(k, v.replace(OLD, NEW_PKG))
+          root.set("package", NEW_PKG)
+
+          # 3) new launcher entry: com.oneplus.camera/com.oneplus.camera.OPCameraActivity (what the McLaren icon pack matches)
+          def is_launcher_filter(f):
+              acts = [a.get(A + "name") for a in f.findall("action")]
+              cats = [x.get(A + "name") for x in f.findall("category")]
+              return "android.intent.action.MAIN" in acts and "android.intent.category.LAUNCHER" in cats
+
+          launchers = [c for c in list(app.findall("activity")) + list(app.findall("activity-alias"))
+                       if any(is_launcher_filter(f) for f in c.findall("intent-filter"))]
+          if not launchers:
+              sys.exit("PATCH FAILED: no launcher activity found")
+          first = launchers[0]
+          target = first.get(A + "targetActivity") if first.tag == "activity-alias" else first.get(A + "name")
+          print("launcher target:", target)
+
+          alias = ET.SubElement(app, "activity-alias")
+          alias.set(A + "name", NEW_ACT)
+          alias.set(A + "targetActivity", target)
+          alias.set(A + "exported", "true")
+          for a in ("label", "icon", "roundIcon"):
+              v = first.get(A + a)
+              if v:
+                  alias.set(A + a, v)
+          f = ET.SubElement(alias, "intent-filter")
+          ET.SubElement(f, "action").set(A + "name", "android.intent.action.MAIN")
+          ET.SubElement(f, "category").set(A + "name", "android.intent.category.LAUNCHER")
+
+          # the old launcher entries must not show a second icon
+          for c in launchers:
+              for flt in c.findall("intent-filter"):
+                  if is_launcher_filter(flt):
+                      c.remove(flt)
+
+          tree.write(man_path, encoding="utf-8", xml_declaration=True)
+          print("manifest rewritten, alias added:", NEW_ACT)
+
+          # 4) code + resources that hard-code the old package (exact string or "old.something")
+          prefix_ok = not any(c.startswith(OLD + ".") for c in classes)
+          if not prefix_ok:
+              print("note: component classes live under the old package name, only exact matches are replaced in smali")
+          pat = re.compile(r'(const-string(?:/jumbo)? [vp]\d+, ")' + re.escape(OLD) + (r'(?=["\.])' if prefix_ok else r'(?=")'))
+          n_files = n_hits = 0
+          for p in glob.glob("out/smali*/**/*.smali", recursive=True):
+              s = open(p, encoding="utf-8").read()
+              s2, n = pat.subn(lambda m: m.group(1) + NEW_PKG, s)
+              if n:
+                  open(p, "w", encoding="utf-8").write(s2)
+                  n_files += 1
+                  n_hits += n
+          print("smali: %d string(s) in %d file(s) renamed" % (n_hits, n_files))
+          for p in glob.glob("out/res/xml/*.xml"):
+              s = open(p, encoding="utf-8").read()
+              s2 = s.replace('targetPackage="%s"' % OLD, 'targetPackage="%s"' % NEW_PKG)
+              if s2 != s:
+                  open(p, "w", encoding="utf-8").write(s2)
+                  print("targetPackage renamed in", p)
+          PY
+
       # Diagnostic only: where the code reads these settings, in case the XML
       # default alone is not enough on some build.
       - name: Record where the settings are read
@@ -168,3 +481,4 @@ jobs:
           path: |
             GCam-patched.apk
             key_reads.txt
+            rebrand_report.txt
