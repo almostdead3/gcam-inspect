@@ -3,12 +3,16 @@ name: Patch GCam (direct gyro fix + default Full / JPEG)
 on:
   workflow_dispatch:
     inputs:
+      apk_link:
+        description: "GCam APK link - paste here (the ORIGINAL new GCam). Leave empty to use the release below"
+        required: false
+        default: ""
       apk_name:
-        description: "GCam APK file name in the release (the ORIGINAL new GCam)"
-        required: true
+        description: "Only if no link: GCam APK file name in the release"
+        required: false
         default: "GCam.apk"
       release_tag:
-        description: "Release tag where the APK was uploaded"
+        description: "Release tag: the patched APK is uploaded here (and the APK is read from here if no link)"
         required: true
         default: "gcam"
       patch_prefs:
@@ -27,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      APK_LINK: ${{ inputs.apk_link }}
       APK: ${{ inputs.apk_name }}
       TAG: ${{ inputs.release_tag }}
       PATCH_PREFS: ${{ inputs.patch_prefs }}
@@ -34,23 +39,38 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-jre-headless zip unzip
+          sudo apt-get install -y default-jre-headless zip unzip aria2
+          python3 -m pip install --break-system-packages gdown
           wget -q "https://github.com/iBotPeaches/apktool/releases/download/v${{ inputs.apktool_version }}/apktool_${{ inputs.apktool_version }}.jar" -O apktool.jar
 
-      - name: Download APK from release
+      - name: Get the APK (link or release)
         run: |
-          gh release download "$TAG" --repo "${{ github.repository }}" \
-            --pattern "$APK" --dir . --clobber
-          ls -lh "$APK"
+          set -euo pipefail
+          if [ -n "$APK_LINK" ]; then
+            echo "Downloading from the pasted link"
+            if echo "$APK_LINK" | grep -q "drive.google.com"; then
+              gdown --fuzzy "$APK_LINK" -O input.apk
+            else
+              aria2c -x16 -s16 -k1M --file-allocation=none -d . -o input.apk "$APK_LINK"
+            fi
+          else
+            echo "No link given, using the release asset"
+            gh release download "$TAG" --repo "${{ github.repository }}" \
+              --pattern "$APK" --dir . --clobber
+            mv -f "$APK" input.apk
+          fi
+          ls -lh input.apk
+          # an expired or wrong link often returns an HTML page instead of the APK
+          unzip -tq input.apk >/dev/null || { echo "The downloaded file is not a valid APK. Check the link."; exit 1; }
 
       # With patch_prefs the resources are decoded too (the settings live in res/xml).
       # Without it, -r keeps resources.arsc untouched (safer rebuild).
       - name: Decompile
         run: |
           if [ "$PATCH_PREFS" = "true" ]; then
-            java -jar apktool.jar d -f "$APK" -o out
+            java -jar apktool.jar d -f input.apk -o out
           else
-            java -jar apktool.jar d -r -f "$APK" -o out
+            java -jar apktool.jar d -r -f input.apk -o out
           fi
 
       - name: Patch
