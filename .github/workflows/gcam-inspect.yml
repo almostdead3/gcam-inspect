@@ -247,6 +247,13 @@ jobs:
                       p = "%s/%s.%s" % (d, name, ext)
                       if os.path.exists(p):
                           out.append(p)
+              if not out:
+                  # the file name can differ from the resource name: use adaptive icon files that start with the name
+                  for p in sorted(glob.glob("out/res/%s*/%s*.xml" % (kind, name))):
+                      if "<adaptive-icon" in open(p, encoding="utf-8").read(2000):
+                          out.append(p)
+                  if not out:
+                      log("files with '%s' in the name: %s" % (name, sorted(glob.glob("out/res/*/*%s*" % name))[:30]))
               return out
 
           def fit(img, size, scale, bg=None):
