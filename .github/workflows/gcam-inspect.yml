@@ -1,16 +1,20 @@
-name: Patch GCam (disable direct gyro channel)
+name: Patch GCam (direct gyro fix + default Full / JPEG)
 
 on:
   workflow_dispatch:
     inputs:
       apk_name:
-        description: "GCam APK file name in the release (the new one that restarts the phone)"
+        description: "GCam APK file name in the release (the ORIGINAL new GCam)"
         required: true
         default: "GCam.apk"
       release_tag:
         description: "Release tag where the APK was uploaded"
         required: true
         default: "gcam"
+      patch_prefs:
+        description: "Also make Hardware level = Full and Viewfinder format = JPEG the defaults (main + front)"
+        type: boolean
+        default: true
       apktool_version:
         description: "apktool version"
         default: "2.9.3"
@@ -25,6 +29,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       APK: ${{ inputs.apk_name }}
       TAG: ${{ inputs.release_tag }}
+      PATCH_PREFS: ${{ inputs.patch_prefs }}
     steps:
       - name: Install tools
         run: |
@@ -38,14 +43,20 @@ jobs:
             --pattern "$APK" --dir . --clobber
           ls -lh "$APK"
 
-      # -r keeps resources.arsc untouched, smali is still decoded
+      # With patch_prefs the resources are decoded too (the settings live in res/xml).
+      # Without it, -r keeps resources.arsc untouched (safer rebuild).
       - name: Decompile
-        run: java -jar apktool.jar d -r -f "$APK" -o out
+        run: |
+          if [ "$PATCH_PREFS" = "true" ]; then
+            java -jar apktool.jar d -f "$APK" -o out
+          else
+            java -jar apktool.jar d -r -f "$APK" -o out
+          fi
 
-      - name: Patch smali
+      - name: Patch
         run: |
           python3 - <<'PY'
-          import subprocess, sys
+          import os, re, subprocess, sys
 
           def find(name):
               r = subprocess.run(["find", "out", "-name", name],
@@ -62,22 +73,42 @@ jobs:
               open(path, "w", encoding="utf-8").write(s.replace(old, new))
               print("patched", path)
 
-          # 1) Provider of the hardware-buffer direct gyro: force "not available",
-          #    so GCam falls back to its normal gyro listener (like the old version).
+          # 1) Direct gyro provider: force "not available" (fixes the phone restart)
           patch(
               find("jhe.smali"),
               "    iget-boolean v1, v1, Llzh;->d:Z\n\n    if-eqz v1, :cond_2\n",
               "    const/4 v1, 0x0\n\n    if-eqz v1, :cond_2\n",
           )
 
-          # 2) Safety net: never call SensorManager.createDirectChannel.
-          #    The code already handles a null result ("Creating direct channel returned null").
+          # 2) Safety net: never call SensorManager.createDirectChannel
           patch(
               find("lww.smali"),
               "    invoke-virtual {v4, v0}, Landroid/hardware/SensorManager;->createDirectChannel(Landroid/hardware/HardwareBuffer;)Landroid/hardware/SensorDirectChannel;\n\n    move-result-object v2\n",
               "    const/4 v2, 0x0\n",
           )
+
+          # 3) Defaults: Hardware level = FULL (-1), Viewfinder format = JPEG (-1)
+          #    value 0 = automatic, -1 = FULL / JPEG, 1 = LEVEL 3 / YUV
+          if os.environ.get("PATCH_PREFS") == "true":
+              xml = "out/res/xml/camera_preferences.xml"
+              s = open(xml, encoding="utf-8").read()
+              for key in ("pref_c2a_key", "pref_c2a_key_front",
+                          "pref_img_key", "pref_img_key_front"):
+                  pat = re.compile(r'(<ListPreference\b[^>]*?android:key="%s"[^>]*?)android:defaultValue="0"' % key)
+                  s, n = pat.subn(r'\1android:defaultValue="-1"', s)
+                  if n != 1:
+                      sys.exit(f"PATCH FAILED: {key}: expected 1 match, found {n}")
+                  print("default set to -1:", key)
+              open(xml, "w", encoding="utf-8").write(s)
           PY
+
+      # Diagnostic only: where the code reads these settings, in case the XML
+      # default alone is not enough on some build.
+      - name: Record where the settings are read
+        run: |
+          grep -rnE '"pref_(c2a|img)_key(_[0-9]|_front)?"' out/smali* > key_reads.txt || true
+          wc -l key_reads.txt
+          head -20 key_reads.txt | cut -c1-200
 
       - name: Rebuild
         run: |
@@ -114,4 +145,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: GCam-patched
-          path: GCam-patched.apk
+          path: |
+            GCam-patched.apk
+            key_reads.txt
