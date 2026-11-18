@@ -670,6 +670,15 @@ jobs:
                  "    invoke-static {p0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n\n    return-void\n.end method")
           open(smali_path, "w", encoding="utf-8").write(src[:meth.start()] + new + src[meth.end():])
           print("loadLibX now loads the baked library directly; the runtime patcher is bypassed")
+
+          # the settings screen must show the patcher as disabled (it no longer runs): fix the first-start settings
+          ap = "out/assets/default_config.xml"
+          if os.path.exists(ap):
+              t = open(ap, encoding="utf-8").read()
+              t2, n = re.subn(r'(<string name="pref_enable_patcher_key">)[^<]*(</string>)', r"\g<1>0\g<2>", t)
+              if n:
+                  open(ap, "w", encoding="utf-8").write(t2)
+                  print("first-start settings: pref_enable_patcher_key set to 0 (patcher shown as disabled)")
           PY
 
       # Diagnostic only: where the code reads these settings, in case the XML
