@@ -442,6 +442,354 @@ jobs:
                   print("targetPackage renamed in", p)
           PY
 
+      - name: Default LMC config (OnePlus7TPro.xml)
+        run: |
+          # optional: put OnePlus7TPro.xml in the repo root (of the branch you run); it becomes the first-start default settings of the app
+          gh api -H "Accept: application/vnd.github.raw" "repos/${{ github.repository }}/contents/OnePlus7TPro.xml?ref=$GITHUB_REF_NAME" > OnePlus7TPro.xml 2>/dev/null || rm -f OnePlus7TPro.xml
+          python3 - <<'PY'
+          import os, re, sys, glob, shutil
+          import xml.etree.ElementTree as ET
+
+          CFG = "OnePlus7TPro.xml"
+          if not os.path.exists(CFG):
+              print("No OnePlus7TPro.xml in the repo root, default config skipped")
+              sys.exit(0)
+
+          ANDROID = "http://schemas.android.com/apk/res/android"
+          A = "{%s}" % ANDROID
+
+          # the config must be a valid SharedPreferences export: <map> ... </map>
+          try:
+              cfg = ET.parse(CFG).getroot()
+          except Exception as e:
+              sys.exit("SEED FAILED: OnePlus7TPro.xml is not valid XML: %s" % e)
+          if cfg.tag != "map":
+              sys.exit("SEED FAILED: OnePlus7TPro.xml must start with <map> (an LMC settings export)")
+          print("config entries:", len(list(cfg)))
+
+          man_path = "out/AndroidManifest.xml"
+          raw = open(man_path, "rb").read()
+          if not raw.lstrip().startswith(b"<"):
+              sys.exit("SEED FAILED: AndroidManifest.xml was not decoded (keep app_name, icon_link or patch_prefs set so apktool decodes resources)")
+          for prefix, uri in re.findall(r'xmlns:([\w-]+)="([^"]+)"', raw.decode("utf-8")):
+              ET.register_namespace(prefix, uri)
+          tree = ET.parse(man_path)
+          root = tree.getroot()
+          app = root.find("application")
+          pkg = root.get("package") or ""
+          if app is None:
+              sys.exit("SEED FAILED: no <application> in AndroidManifest.xml")
+
+          smali_dirs = sorted(glob.glob("out/smali*"))
+          if not smali_dirs:
+              sys.exit("SEED FAILED: no smali folder found")
+
+          # 1) the config goes into the APK as an asset
+          os.makedirs("out/assets", exist_ok=True)
+          shutil.copyfile(CFG, "out/assets/default_config.xml")
+
+          # 2) helper class: on the FIRST start only (no settings file yet) copy the asset to shared_prefs/<package>_preferences.xml
+          HELPER = r'''.class public Lpatch/SeedPrefs;
+          .super Ljava/lang/Object;
+
+          .method public static run(Landroid/content/Context;)V
+              .locals 9
+
+              :try_start_0
+              invoke-virtual {p0}, Landroid/content/Context;->getApplicationInfo()Landroid/content/pm/ApplicationInfo;
+
+              move-result-object v0
+
+              iget-object v0, v0, Landroid/content/pm/ApplicationInfo;->dataDir:Ljava/lang/String;
+
+              new-instance v1, Ljava/io/File;
+
+              const-string v2, "default_config_applied"
+
+              invoke-direct {v1, v0, v2}, Ljava/io/File;-><init>(Ljava/lang/String;Ljava/lang/String;)V
+
+              invoke-virtual {v1}, Ljava/io/File;->exists()Z
+
+              move-result v2
+
+              if-nez v2, :done
+
+              new-instance v2, Ljava/io/File;
+
+              const-string v3, "shared_prefs"
+
+              invoke-direct {v2, v0, v3}, Ljava/io/File;-><init>(Ljava/lang/String;Ljava/lang/String;)V
+
+              invoke-virtual {v2}, Ljava/io/File;->mkdirs()Z
+
+              new-instance v3, Ljava/lang/StringBuilder;
+
+              invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
+
+              invoke-virtual {p0}, Landroid/content/Context;->getPackageName()Ljava/lang/String;
+
+              move-result-object v4
+
+              invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+              const-string v4, "_preferences.xml"
+
+              invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+              invoke-virtual {v3}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+              move-result-object v3
+
+              new-instance v4, Ljava/io/File;
+
+              invoke-direct {v4, v2, v3}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
+
+              invoke-virtual {v1}, Ljava/io/File;->createNewFile()Z
+
+              invoke-virtual {v4}, Ljava/io/File;->exists()Z
+
+              move-result v5
+
+              if-nez v5, :done
+
+              invoke-virtual {p0}, Landroid/content/Context;->getAssets()Landroid/content/res/AssetManager;
+
+              move-result-object v5
+
+              const-string v6, "default_config.xml"
+
+              invoke-virtual {v5, v6}, Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;
+
+              move-result-object v5
+
+              new-instance v6, Ljava/io/FileOutputStream;
+
+              invoke-direct {v6, v4}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+
+              const/16 v7, 0x2000
+
+              new-array v7, v7, [B
+
+              :loop
+              invoke-virtual {v5, v7}, Ljava/io/InputStream;->read([B)I
+
+              move-result v8
+
+              if-ltz v8, :copied
+
+              const/4 v0, 0x0
+
+              invoke-virtual {v6, v7, v0, v8}, Ljava/io/OutputStream;->write([BII)V
+
+              goto :loop
+
+              :copied
+              invoke-virtual {v6}, Ljava/io/OutputStream;->close()V
+
+              invoke-virtual {v5}, Ljava/io/InputStream;->close()V
+
+              :done
+              return-void
+              :try_end_0
+              .catch Ljava/lang/Throwable; {:try_start_0 .. :try_end_0} :catch_0
+
+              :catch_0
+              move-exception v0
+
+              return-void
+          .end method
+          '''
+          os.makedirs(os.path.join(smali_dirs[0], "patch"), exist_ok=True)
+          open(os.path.join(smali_dirs[0], "patch", "SeedPrefs.smali"), "w", encoding="utf-8").write(HELPER)
+
+          # 3) call the helper at the very start of Application.attachBaseContext (before anything reads the settings)
+          CALL = "    invoke-static {p1}, Lpatch/SeedPrefs;->run(Landroid/content/Context;)V\n\n"
+          name = app.get(A + "name")
+          if name:
+              if name.startswith("."):
+                  name = pkg + name
+              elif "." not in name:
+                  name = pkg + "." + name
+              path = None
+              for d in smali_dirs:
+                  p = os.path.join(d, name.replace(".", "/") + ".smali")
+                  if os.path.exists(p):
+                      path = p
+                      break
+              if path is None:
+                  sys.exit("SEED FAILED: smali file of the Application class %s not found" % name)
+              s = open(path, encoding="utf-8").read()
+              m = re.search(r"^\.method [^\n]*attachBaseContext\(Landroid/content/Context;\)V\n(?:    \.(?:locals|registers) \d+\n)", s, re.M)
+              if m:
+                  s = s[:m.end()] + "\n" + CALL.rstrip("\n") + "\n" + s[m.end():]
+                  print("hooked existing attachBaseContext in", path)
+              else:
+                  sup = re.search(r"^\.super (L[^;]+;)", s, re.M).group(1)
+                  add = ("\n.method protected attachBaseContext(Landroid/content/Context;)V\n    .locals 0\n\n" + CALL +
+                         "    invoke-super {p0, p1}, %s->attachBaseContext(Landroid/content/Context;)V\n\n    return-void\n.end method\n" % sup)
+                  s = s.rstrip("\n") + "\n" + add
+                  print("added attachBaseContext to", path)
+              open(path, "w", encoding="utf-8").write(s)
+          else:
+              # no custom Application class: add a tiny one and register it
+              smali = (".class public Lpatch/SeedApplication;\n.super Landroid/app/Application;\n\n"
+                       ".method public constructor <init>()V\n    .locals 0\n\n    invoke-direct {p0}, Landroid/app/Application;-><init>()V\n\n    return-void\n.end method\n\n"
+                       ".method protected attachBaseContext(Landroid/content/Context;)V\n    .locals 0\n\n" + CALL +
+                       "    invoke-super {p0, p1}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V\n\n    return-void\n.end method\n")
+              open(os.path.join(smali_dirs[0], "patch", "SeedApplication.smali"), "w", encoding="utf-8").write(smali)
+              app.set(A + "name", "patch.SeedApplication")
+              tree.write(man_path, encoding="utf-8", xml_declaration=True)
+              print("no Application class, added patch.SeedApplication")
+          print("default config will be copied to shared_prefs/<package>_preferences.xml on the first start")
+          PY
+
+      - name: Bake lib patches into the APK (no runtime patcher)
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, glob
+          import xml.etree.ElementTree as ET
+
+          CFG = "OnePlus7TPro.xml"
+          if not os.path.exists(CFG):
+              print("No OnePlus7TPro.xml in the repo root, nothing baked in")
+              sys.exit(0)
+
+          def skip(msg):
+              print("BAKE SKIPPED (the app keeps its normal runtime patcher): " + msg)
+              sys.exit(0)
+
+          # ---- settings (same file the app reads: SharedPreferences) ----
+          try:
+              prefs = {e.get("name"): (e.text or "") for e in ET.parse(CFG).getroot() if e.tag == "string"}
+          except Exception as e:
+              skip("%s is not valid XML: %s" % (CFG, e))
+
+          # ---- the app's patcher class ----
+          hits = [p for p in glob.glob("out/smali*/com/SDE/LibPatcher.smali")]
+          if len(hits) != 1:
+              skip("com/SDE/LibPatcher.smali not found (this GCam has no LMC lib patcher)")
+          smali_path = hits[0]
+          src = open(smali_path, encoding="utf-8").read()
+          lib_path = "out/lib/arm64-v8a/libgcastartup.so"
+          if not os.path.exists(lib_path):
+              skip("%s not found" % lib_path)
+
+          offs = {m.group(1): int(m.group(2), 16)
+                  for m in re.finditer(r"^\.field [\w ]*static final (_\w+):I = (0x[0-9a-fA-F]+)\s*$", src, re.M)}
+          m = re.search(r"^\.method private static copyLib\(Lcom/SDE/LibPatcher;\)Z\n(.*?)^\.end method", src, re.S | re.M)
+          if not m or not offs:
+              skip("copyLib() or the offsets were not found in LibPatcher.smali")
+
+          # ---- lens suffix: the lib is patched for the lens that is selected at start (back main = no suffix) ----
+          def aux():
+              try:
+                  return int(prefs.get("pref_aux_key", "0") or 0)
+              except ValueError:
+                  return 0
+          SUFFIX = {0: "", 1: "_2", 2: "_3", 3: "_4", 4: "_5"}
+
+          def get_string(k):
+              return prefs.get(k, "0")
+
+          writes = []
+          def set_hex(off, hexs):
+              if len(hexs) >= 2:
+                  if len(hexs) % 2:
+                      hexs = hexs[:-1]
+                  writes.append((off, bytes.fromhex(hexs)))
+
+          # ---- tiny interpreter for the straight-line + simple-branch smali of copyLib() ----
+          lines = []
+          for l in m.group(1).split("\n"):
+              l = l.strip()
+              if l and not l.startswith("#") and not l.startswith("."):
+                  lines.append(l)
+          labels = {l: i for i, l in enumerate(lines) if l.startswith(":")}
+          reg = {}
+          res = None
+          i = 0
+          steps = 0
+          try:
+              while i < len(lines):
+                  steps += 1
+                  if steps > 200000:
+                      raise RuntimeError("too many steps")
+                  l = lines[i]; i += 1
+                  if l.startswith(":"):
+                      continue
+                  mm = re.match(r'const-string(?:/jumbo)? (\w+), "(.*)"$', l)
+                  if mm: reg[mm.group(1)] = mm.group(2); continue
+                  mm = re.match(r"const(?:/4|/16|/high16)? (\w+), (-?0x[0-9a-fA-F]+)$", l)
+                  if mm: reg[mm.group(1)] = int(mm.group(2), 16); continue
+                  mm = re.match(r"sget (\w+), Lcom/SDE/LibPatcher;->(\w+):I$", l)
+                  if mm: reg[mm.group(1)] = offs[mm.group(2)]; continue
+                  mm = re.match(r"invoke-static \{(\w+)\}, (L[^;]+;)->(\w+)\(", l)
+                  if mm:
+                      a = reg[mm.group(1)]; c, f = mm.group(2), mm.group(3)
+                      if c == "Lcom/SDE/LensValue;" and f == "SetLensValue": res = a + SUFFIX.get(aux(), "")
+                      elif f == "getIntValue": res = int(get_string(a))
+                      elif f == "getHexIntValue": res = int(get_string(a), 16)
+                      elif c == "Lcom/Fix/Pref;" and f == "MenuValue":
+                          v = prefs.get(a, "")
+                          res = int(v) if v != "" else 0
+                      else: raise RuntimeError("unknown call " + l)
+                      continue
+                  mm = re.match(r"invoke-virtual \{p0, (\w+), (\w+)\}, Lcom/SDE/LibPatcher;->(setValueHex|setValueHexToo)\(", l)
+                  if mm:
+                      off, arg = reg[mm.group(1)], reg[mm.group(2)]
+                      set_hex(off, get_string(arg) if mm.group(3) == "setValueHex" else arg)
+                      continue
+                  mm = re.match(r"invoke-virtual \{p0\}, Lcom/SDE/LibPatcher;->(setToneCurve|setGammaCurve)\(\)V$", l)
+                  if mm: raise RuntimeError("%s is enabled in the config (not supported by the baker)" % mm.group(1))
+                  if l.startswith("invoke-virtual {p0}, Lcom/SDE/LibPatcher;->getAppContext"):
+                      break                       # the rest only loads the patched lib
+                  mm = re.match(r"move-result(?:-object)? (\w+)$", l)
+                  if mm: reg[mm.group(1)] = res; continue
+                  mm = re.match(r"if-(eqz|nez) (\w+), (:\w+)$", l)
+                  if mm:
+                      z = (reg[mm.group(2)] == 0)
+                      if (mm.group(1) == "eqz") == z: i = labels[mm.group(3)] + 1
+                      continue
+                  mm = re.match(r"goto (:\w+)$", l)
+                  if mm: i = labels[mm.group(1)] + 1; continue
+                  raise RuntimeError("unknown instruction: " + l)
+          except Exception as e:
+              skip("could not read the patcher logic (%s)" % e)
+
+          size = os.path.getsize(lib_path)
+          bad = [(o, len(b)) for o, b in writes if o + len(b) > size]
+          if bad:
+              skip("offsets outside the library (%s): a different GCam build?" % bad[:3])
+
+          # ---- apply the same writes to the library inside the APK ----
+          changed = 0
+          with open(lib_path, "r+b") as f:
+              for o, b in writes:
+                  f.seek(o)
+                  old = f.read(len(b))
+                  if old != b: changed += len(b)
+                  f.seek(o); f.write(b)
+          print("patcher writes: %d, bytes changed in libgcastartup.so: %d" % (len(writes), changed))
+
+          # ---- the app must load that library directly (no runtime patcher) ----
+          meth = re.search(r"^\.method public static loadLibX\(Ljava/lang/String;\)V\n.*?^\.end method", src, re.S | re.M)
+          if not meth:
+              skip("loadLibX() not found")
+          new = (".method public static loadLibX(Ljava/lang/String;)V\n    .locals 0\n\n"
+                 "    invoke-static {p0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n\n    return-void\n.end method")
+          open(smali_path, "w", encoding="utf-8").write(src[:meth.start()] + new + src[meth.end():])
+          print("loadLibX now loads the baked library directly; the runtime patcher is bypassed")
+
+          # the settings screen must show the patcher as disabled (it no longer runs): fix the first-start settings
+          ap = "out/assets/default_config.xml"
+          if os.path.exists(ap):
+              t = open(ap, encoding="utf-8").read()
+              t2, n = re.subn(r'(<string name="pref_enable_patcher_key">)[^<]*(</string>)', r"\g<1>0\g<2>", t)
+              if n:
+                  open(ap, "w", encoding="utf-8").write(t2)
+                  print("first-start settings: pref_enable_patcher_key set to 0 (patcher shown as disabled)")
+          PY
+
       # Diagnostic only: where the code reads these settings, in case the XML
       # default alone is not enough on some build.
       - name: Record where the settings are read
