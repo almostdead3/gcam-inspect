@@ -534,6 +534,144 @@ jobs:
           print("default config will be copied to shared_prefs/<package>_preferences.xml on the first start")
           PY
 
+      - name: Bake lib patches into the APK (no runtime patcher)
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, glob
+          import xml.etree.ElementTree as ET
+
+          CFG = "OnePlus7TPro.xml"
+          if not os.path.exists(CFG):
+              print("No OnePlus7TPro.xml in the repo root, nothing baked in")
+              sys.exit(0)
+
+          def skip(msg):
+              print("BAKE SKIPPED (the app keeps its normal runtime patcher): " + msg)
+              sys.exit(0)
+
+          # ---- settings (same file the app reads: SharedPreferences) ----
+          try:
+              prefs = {e.get("name"): (e.text or "") for e in ET.parse(CFG).getroot() if e.tag == "string"}
+          except Exception as e:
+              skip("%s is not valid XML: %s" % (CFG, e))
+
+          # ---- the app's patcher class ----
+          hits = [p for p in glob.glob("out/smali*/com/SDE/LibPatcher.smali")]
+          if len(hits) != 1:
+              skip("com/SDE/LibPatcher.smali not found (this GCam has no LMC lib patcher)")
+          smali_path = hits[0]
+          src = open(smali_path, encoding="utf-8").read()
+          lib_path = "out/lib/arm64-v8a/libgcastartup.so"
+          if not os.path.exists(lib_path):
+              skip("%s not found" % lib_path)
+
+          offs = {m.group(1): int(m.group(2), 16)
+                  for m in re.finditer(r"^\.field [\w ]*static final (_\w+):I = (0x[0-9a-fA-F]+)\s*$", src, re.M)}
+          m = re.search(r"^\.method private static copyLib\(Lcom/SDE/LibPatcher;\)Z\n(.*?)^\.end method", src, re.S | re.M)
+          if not m or not offs:
+              skip("copyLib() or the offsets were not found in LibPatcher.smali")
+
+          # ---- lens suffix: the lib is patched for the lens that is selected at start (back main = no suffix) ----
+          def aux():
+              try:
+                  return int(prefs.get("pref_aux_key", "0") or 0)
+              except ValueError:
+                  return 0
+          SUFFIX = {0: "", 1: "_2", 2: "_3", 3: "_4", 4: "_5"}
+
+          def get_string(k):
+              return prefs.get(k, "0")
+
+          writes = []
+          def set_hex(off, hexs):
+              if len(hexs) >= 2:
+                  if len(hexs) % 2:
+                      hexs = hexs[:-1]
+                  writes.append((off, bytes.fromhex(hexs)))
+
+          # ---- tiny interpreter for the straight-line + simple-branch smali of copyLib() ----
+          lines = []
+          for l in m.group(1).split("\n"):
+              l = l.strip()
+              if l and not l.startswith("#") and not l.startswith("."):
+                  lines.append(l)
+          labels = {l: i for i, l in enumerate(lines) if l.startswith(":")}
+          reg = {}
+          res = None
+          i = 0
+          steps = 0
+          try:
+              while i < len(lines):
+                  steps += 1
+                  if steps > 200000:
+                      raise RuntimeError("too many steps")
+                  l = lines[i]; i += 1
+                  if l.startswith(":"):
+                      continue
+                  mm = re.match(r'const-string(?:/jumbo)? (\w+), "(.*)"$', l)
+                  if mm: reg[mm.group(1)] = mm.group(2); continue
+                  mm = re.match(r"const(?:/4|/16|/high16)? (\w+), (-?0x[0-9a-fA-F]+)$", l)
+                  if mm: reg[mm.group(1)] = int(mm.group(2), 16); continue
+                  mm = re.match(r"sget (\w+), Lcom/SDE/LibPatcher;->(\w+):I$", l)
+                  if mm: reg[mm.group(1)] = offs[mm.group(2)]; continue
+                  mm = re.match(r"invoke-static \{(\w+)\}, (L[^;]+;)->(\w+)\(", l)
+                  if mm:
+                      a = reg[mm.group(1)]; c, f = mm.group(2), mm.group(3)
+                      if c == "Lcom/SDE/LensValue;" and f == "SetLensValue": res = a + SUFFIX.get(aux(), "")
+                      elif f == "getIntValue": res = int(get_string(a))
+                      elif f == "getHexIntValue": res = int(get_string(a), 16)
+                      elif c == "Lcom/Fix/Pref;" and f == "MenuValue":
+                          v = prefs.get(a, "")
+                          res = int(v) if v != "" else 0
+                      else: raise RuntimeError("unknown call " + l)
+                      continue
+                  mm = re.match(r"invoke-virtual \{p0, (\w+), (\w+)\}, Lcom/SDE/LibPatcher;->(setValueHex|setValueHexToo)\(", l)
+                  if mm:
+                      off, arg = reg[mm.group(1)], reg[mm.group(2)]
+                      set_hex(off, get_string(arg) if mm.group(3) == "setValueHex" else arg)
+                      continue
+                  mm = re.match(r"invoke-virtual \{p0\}, Lcom/SDE/LibPatcher;->(setToneCurve|setGammaCurve)\(\)V$", l)
+                  if mm: raise RuntimeError("%s is enabled in the config (not supported by the baker)" % mm.group(1))
+                  if l.startswith("invoke-virtual {p0}, Lcom/SDE/LibPatcher;->getAppContext"):
+                      break                       # the rest only loads the patched lib
+                  mm = re.match(r"move-result(?:-object)? (\w+)$", l)
+                  if mm: reg[mm.group(1)] = res; continue
+                  mm = re.match(r"if-(eqz|nez) (\w+), (:\w+)$", l)
+                  if mm:
+                      z = (reg[mm.group(2)] == 0)
+                      if (mm.group(1) == "eqz") == z: i = labels[mm.group(3)] + 1
+                      continue
+                  mm = re.match(r"goto (:\w+)$", l)
+                  if mm: i = labels[mm.group(1)] + 1; continue
+                  raise RuntimeError("unknown instruction: " + l)
+          except Exception as e:
+              skip("could not read the patcher logic (%s)" % e)
+
+          size = os.path.getsize(lib_path)
+          bad = [(o, len(b)) for o, b in writes if o + len(b) > size]
+          if bad:
+              skip("offsets outside the library (%s): a different GCam build?" % bad[:3])
+
+          # ---- apply the same writes to the library inside the APK ----
+          changed = 0
+          with open(lib_path, "r+b") as f:
+              for o, b in writes:
+                  f.seek(o)
+                  old = f.read(len(b))
+                  if old != b: changed += len(b)
+                  f.seek(o); f.write(b)
+          print("patcher writes: %d, bytes changed in libgcastartup.so: %d" % (len(writes), changed))
+
+          # ---- the app must load that library directly (no runtime patcher) ----
+          meth = re.search(r"^\.method public static loadLibX\(Ljava/lang/String;\)V\n.*?^\.end method", src, re.S | re.M)
+          if not meth:
+              skip("loadLibX() not found")
+          new = (".method public static loadLibX(Ljava/lang/String;)V\n    .locals 0\n\n"
+                 "    invoke-static {p0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n\n    return-void\n.end method")
+          open(smali_path, "w", encoding="utf-8").write(src[:meth.start()] + new + src[meth.end():])
+          print("loadLibX now loads the baked library directly; the runtime patcher is bypassed")
+          PY
+
       # Diagnostic only: where the code reads these settings, in case the XML
       # default alone is not enough on some build.
       - name: Record where the settings are read
