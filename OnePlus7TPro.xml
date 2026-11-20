@@ -502,7 +502,7 @@
     <string name="lib_lumadh_l5_key_5">0</string>
     <string name="lib_sabrelnewn_l6_key_front">0</string>
     <string name="gg_4_key">1.063</string>
-    <string name="lib_hdrraw2_key">0850761E</string>
+    <string name="lib_hdrraw2_key">08F0771E</string>
     <string name="lib_allowtemporalbinning_key_5">0</string>
     <string name="lib_lumadlsabre_l1a_key_front">0</string>
     <string name="pref_awb_key_3">0</string>
@@ -868,7 +868,7 @@
     <string name="bg_1_key">-0.914</string>
     <string name="lib_softsharpa_key_2">0</string>
     <string name="lib_softsharpa_key_3">0</string>
-    <string name="lib_dehazedblack_key">0190201E</string>
+    <string name="lib_dehazedblack_key">0150201E</string>
     <string name="lib_lutnoisefix_key_5">0</string>
     <string name="lib_lutnoisefix_key_4">0</string>
     <string name="pref_manual_cameraid_front_3_key">1</string>
@@ -1185,7 +1185,7 @@
     <string name="lib_sabrburmerge3_pro_key">0</string>
     <string name="pref_opmode_experimental_key_5">0</string>
     <string name="lib_lumadhs_l2_key_3">0</string>
-    <string name="lib_ccontrast2_key">01502E1E</string>
+    <string name="lib_ccontrast2_key">01502F1E</string>
     <string name="prefix_key"></string>
     <string name="lib_green_key_3">0</string>
     <string name="lib_green_key_2">0</string>
@@ -1396,7 +1396,7 @@
     <string name="lib_temporal_radius_key_4">0</string>
     <string name="lib_temporal_radius_key_3">0</string>
     <string name="lib_temporal_radius_key_2">0</string>
-    <string name="lib_lighting_key">02D02E1E</string>
+    <string name="lib_lighting_key">02102F1E</string>
     <string name="lib_shadow_compensation_pro_key">0</string>
     <string name="lib_lumadms_l2_pro_key">0</string>
     <string name="lib_highlight2_pro_key">0</string>
@@ -1666,7 +1666,7 @@
     <string name="a_rg_key_3">0.87653</string>
     <string name="a_rg_key_4">0.87653</string>
     <string name="a_rg_key_5">0.87653</string>
-    <string name="lib_contr_key">05D02D1E</string>
+    <string name="lib_contr_key">05B02D1E</string>
     <string name="lib_softsharpc_key_3">0</string>
     <string name="lib_softsharpc_key_2">0</string>
     <string name="lib_sharpnessa_pro_key">0</string>
@@ -2491,7 +2491,7 @@
     <string name="lib_tuncolsatpar1_key">0</string>
     <string name="lib_downsamplebybeforemerge_key_2">0</string>
     <string name="pref_zoom_out_command_string">20</string>
-    <string name="lib_ncontrast1_key">0D103D1E</string>
+    <string name="lib_ncontrast1_key">0D103C1E</string>
     <string name="lib_lightfix2_key_2">0</string>
     <string name="lib_vignettec_key_2">0</string>
     <string name="lib_downsamplebybeforemerge_key_3">0</string>
@@ -2595,7 +2595,7 @@
     <string name="pref_noise_modeler_manual_c_0_key">1.9878738E-12</string>
     <string name="lib_lumadlsabre_l1b_key_2">0</string>
     <string name="pref_img_key">-1</string>
-    <string name="lib_contrast_2_key">14AE47E17A14DE3F</string>
+    <string name="lib_contrast_2_key">9A9999999999E13F</string>
     <string name="lib_sharpgainmacro_key_2">0</string>
     <string name="lib_sabrenoiseart_key_front">0</string>
     <string name="f_bg_key">0.39831</string>
